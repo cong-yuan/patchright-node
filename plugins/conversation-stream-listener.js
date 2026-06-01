@@ -4,12 +4,21 @@ function attachConversationStreamListener(target, options = {}) {
   const wsPattern =
     options.wsPattern || /chatgpt\.com|chat\.openai\.com|\/backend-api\//;
   const debug = Boolean(options.debug);
+  const printFinal = Boolean(options.printFinal);
+  const onFinalResponse =
+    typeof options.onFinalResponse === "function" ? options.onFinalResponse : null;
+
   const streamState = {
     lastRealtimeOutputAt: 0,
     streams: new Map(),
+    pendingFinalTexts: [],
+    waiters: [],
   };
 
-  attachFetchStreamListener(target, targetPattern, streamState, debug);
+  attachFetchStreamListener(target, targetPattern, streamState, debug, {
+    printFinal,
+    onFinalResponse,
+  });
 
   target.on("request", async (request) => {
     const url = request.url();
@@ -20,7 +29,7 @@ function attachConversationStreamListener(target, options = {}) {
     if (q) console.log(`\n[Q] ${q}`);
   });
 
-  // Keep HTTP response path as a fallback when realtime page-side stream capture fails.
+  // HTTP fallback when page-side realtime stream capture fails.
   target.on("response", async (response) => {
     const url = response.url();
     if (!targetPattern.test(url)) return;
@@ -30,20 +39,21 @@ function attachConversationStreamListener(target, options = {}) {
       if (Date.now() - streamState.lastRealtimeOutputAt < 5000) return;
 
       const events = parseSseEvents(bodyText);
+      let finalText = "";
 
-      let started = false;
       for (const evt of events) {
         const text = extractAssistantTextFromEvent(evt);
         if (!text) continue;
-
-        if (!started) {
-          process.stdout.write("[A] ");
-          started = true;
-        }
-        process.stdout.write(text);
+        finalText += text;
       }
 
-      if (started) process.stdout.write("\n");
+      if (finalText.trim()) {
+        emitFinalResponse(finalText, streamState, {
+          printFinal,
+          onFinalResponse,
+          source: "response-fallback",
+        });
+      }
     } catch (error) {
       console.error("[stream][error]", error.message || error);
     }
@@ -53,38 +63,41 @@ function attachConversationStreamListener(target, options = {}) {
     const wsUrl = ws.url();
     if (!wsPattern.test(wsUrl)) return;
 
-    let started = false;
-
     ws.on("framereceived", ({ payload }) => {
       if (typeof payload !== "string") return;
 
       const events = parseSseEvents(payload);
+      let frameText = "";
       for (const evt of events) {
         const text = extractAssistantTextFromEvent(evt);
         if (!text) continue;
-
-        if (!started) {
-          process.stdout.write("[A] ");
-          started = true;
-        }
-        process.stdout.write(text);
+        frameText += text;
       }
-    });
 
-    ws.on("close", () => {
-      if (started) process.stdout.write("\n");
+      if (frameText) streamState.lastRealtimeOutputAt = Date.now();
     });
   });
+
+  return {
+    waitForNextFinalResponse: ({ timeoutMs = 120000 } = {}) =>
+      waitForNextFinalResponse(streamState, timeoutMs),
+  };
 }
 
-async function attachFetchStreamListener(target, targetPattern, streamState, debug) {
+async function attachFetchStreamListener(
+  target,
+  targetPattern,
+  streamState,
+  debug,
+  emitOptions,
+) {
   try {
     if (!target.exposeBinding || !target.addInitScript) return;
 
     const bindingName = "__conversationStreamListenerChunk";
 
     await target.exposeBinding(bindingName, (_source, payload) => {
-      handleRealtimePayload(payload, streamState);
+      handleRealtimePayload(payload, streamState, emitOptions);
     });
 
     await target.addInitScript(
@@ -168,17 +181,16 @@ async function attachFetchStreamListener(target, targetPattern, streamState, deb
     if (debug) console.log("[stream][debug] fetch stream hook installed");
   } catch (error) {
     if (debug) console.error("[stream][debug] fetch stream hook failed", error);
-    // Ignore setup failures and keep response.text() fallback behavior.
   }
 }
 
-function handleRealtimePayload(payload, streamState) {
+function handleRealtimePayload(payload, streamState, emitOptions) {
   if (!payload || typeof payload !== "object") return;
 
   if (payload.type === "start") {
     streamState.streams.set(payload.id, {
       buffer: "",
-      started: false,
+      fullText: "",
     });
     return;
   }
@@ -193,7 +205,14 @@ function handleRealtimePayload(payload, streamState) {
 
   if (payload.type === "done" || payload.type === "error") {
     consumeSseChunk(state, "\n\n", streamState);
-    if (state.started) process.stdout.write("\n");
+
+    if (state.fullText.trim()) {
+      emitFinalResponse(state.fullText, streamState, {
+        ...emitOptions,
+        source: payload.type,
+      });
+    }
+
     streamState.streams.delete(payload.id);
   }
 }
@@ -205,7 +224,7 @@ function consumeSseChunk(state, chunk, streamState) {
 
   while (true) {
     const boundary = findSseBoundary(state.buffer);
-    if (!boundary) return;
+    if (!boundary) break;
 
     const block = state.buffer.slice(0, boundary.index);
     state.buffer = state.buffer.slice(boundary.end);
@@ -215,15 +234,50 @@ function consumeSseChunk(state, chunk, streamState) {
       const text = extractAssistantTextFromEvent(evt);
       if (!text) continue;
 
-      if (!state.started) {
-        process.stdout.write("[A] ");
-        state.started = true;
-      }
-
-      process.stdout.write(text);
+      state.fullText += text;
       streamState.lastRealtimeOutputAt = Date.now();
     }
   }
+}
+
+function emitFinalResponse(text, streamState, options = {}) {
+  const finalText = (text || "").trim();
+  if (!finalText) return;
+
+  if (options.printFinal) console.log(`[A] ${finalText}`);
+  if (typeof options.onFinalResponse === "function") {
+    options.onFinalResponse(finalText, { source: options.source || "unknown" });
+  }
+
+  const waiter = streamState.waiters.shift();
+  if (waiter) {
+    waiter.resolve({ text: finalText });
+    return;
+  }
+
+  streamState.pendingFinalTexts.push(finalText);
+}
+
+function waitForNextFinalResponse(streamState, timeoutMs) {
+  if (streamState.pendingFinalTexts.length > 0) {
+    const text = streamState.pendingFinalTexts.shift();
+    return Promise.resolve({ text });
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const idx = streamState.waiters.findIndex((w) => w.resolve === resolve);
+      if (idx >= 0) streamState.waiters.splice(idx, 1);
+      reject(new Error(`waitForNextFinalResponse timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    streamState.waiters.push({
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+    });
+  });
 }
 
 function findSseBoundary(buffer) {
@@ -234,7 +288,9 @@ function findSseBoundary(buffer) {
   if (lf === -1) return { index: crlf, end: crlf + 4 };
   if (crlf === -1) return { index: lf, end: lf + 2 };
 
-  return lf < crlf ? { index: lf, end: lf + 2 } : { index: crlf, end: crlf + 4 };
+  return lf < crlf
+    ? { index: lf, end: lf + 2 }
+    : { index: crlf, end: crlf + 4 };
 }
 
 function parseSseEvents(raw) {
@@ -276,7 +332,6 @@ function parseSseEvents(raw) {
 function extractAssistantTextFromEvent(evt) {
   if (!evt || typeof evt.data !== "string") return "";
 
-  // We only care about text-bearing delta events.
   if (evt.event !== "delta" && evt.event !== "message") return "";
 
   try {
