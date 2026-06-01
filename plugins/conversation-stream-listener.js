@@ -7,6 +7,8 @@ function attachConversationStreamListener(target, options = {}) {
   const streamState = {
     lastRealtimeOutputAt: 0,
     streams: new Map(),
+    pendingDeltas: [],
+    deltaWaiters: [],
     pendingFinalResponses: [],
     waiters: [],
   };
@@ -47,6 +49,10 @@ function attachConversationStreamListener(target, options = {}) {
   return {
     waitForNextFinalResponse: ({ timeoutMs = 120000 } = {}) =>
       waitForNextFinalResponse(streamState, timeoutMs),
+    waitForNextDelta: ({ timeoutMs = 2000 } = {}) =>
+      waitForNextDelta(streamState, timeoutMs),
+    cancelPendingDeltaWaiters: () => cancelPendingDeltaWaiters(streamState),
+    clearPending: () => clearPending(streamState),
   };
 }
 
@@ -194,6 +200,7 @@ function consumeSseEvent(state, evt, streamState) {
   if (text) {
     state.fullText += text;
     streamState.lastRealtimeOutputAt = Date.now();
+    emitDelta(text, streamState);
   }
 
   const metaPatch = extractMetaFromEvent(evt);
@@ -318,6 +325,18 @@ function emitFinalResponse(finalResponse, streamState) {
   streamState.pendingFinalResponses.push(finalResponse);
 }
 
+function emitDelta(deltaText, streamState) {
+  if (!deltaText) return;
+
+  const waiter = streamState.deltaWaiters.shift();
+  if (waiter) {
+    waiter.resolve(deltaText);
+    return;
+  }
+
+  streamState.pendingDeltas.push(deltaText);
+}
+
 function waitForNextFinalResponse(streamState, timeoutMs) {
   if (streamState.pendingFinalResponses.length > 0) {
     return Promise.resolve(streamState.pendingFinalResponses.shift());
@@ -337,6 +356,42 @@ function waitForNextFinalResponse(streamState, timeoutMs) {
       },
     });
   });
+}
+
+function waitForNextDelta(streamState, timeoutMs) {
+  if (streamState.pendingDeltas.length > 0) {
+    return Promise.resolve(streamState.pendingDeltas.shift());
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const idx = streamState.deltaWaiters.findIndex((w) => w.resolve === resolve);
+      if (idx >= 0) streamState.deltaWaiters.splice(idx, 1);
+      resolve(null);
+    }, timeoutMs);
+
+    streamState.deltaWaiters.push({
+      timer,
+      resolve: (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+    });
+  });
+}
+
+function clearPending(streamState) {
+  streamState.pendingDeltas.length = 0;
+  streamState.pendingFinalResponses.length = 0;
+  cancelPendingDeltaWaiters(streamState);
+}
+
+function cancelPendingDeltaWaiters(streamState) {
+  const deltaWaiters = streamState.deltaWaiters.splice(0);
+  for (const waiter of deltaWaiters) {
+    clearTimeout(waiter.timer);
+    waiter.resolve(null);
+  }
 }
 
 function findSseBoundary(buffer) {

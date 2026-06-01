@@ -12,6 +12,11 @@ const DEFAULT_MODEL = process.env.MODEL_NAME || "chatgpt-web-proxy";
 const SYSTEM_FINGERPRINT =
   process.env.SYSTEM_FINGERPRINT || "fp_patchright_node_proxy_v1";
 const NEW_CHAT_URL = process.env.NEW_CHAT_URL || "https://chatgpt.com/";
+const API_LOG = (process.env.API_LOG || "1") !== "0";
+const API_LOG_USER_TEXT = (process.env.API_LOG_USER_TEXT || "1") !== "0";
+const API_LOG_BODY_SNIPPET = (process.env.API_LOG_BODY_SNIPPET || "0") !== "0";
+const API_LOG_BODY_MAX_CHARS = Number(process.env.API_LOG_BODY_MAX_CHARS || 4096);
+const STREAM_REALTIME_DELTAS = (process.env.STREAM_REALTIME_DELTAS || "0") === "1";
 
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -20,7 +25,25 @@ function jsonResponse(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function parseBody(req) {
+function makeId(prefix) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function safeSnippet(value, maxLen = 200) {
+  if (typeof value !== "string") return "";
+  const s = value.replace(/\s+/g, " ").trim();
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, maxLen)}…`;
+}
+
+function logApi(payload) {
+  if (!API_LOG) return;
+  try {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), ...payload }));
+  } catch {}
+}
+
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
     req.on("data", (chunk) => {
@@ -30,15 +53,14 @@ function parseBody(req) {
         req.destroy();
       }
     });
-    req.on("end", () => {
-      try {
-        resolve(raw ? JSON.parse(raw) : {});
-      } catch (error) {
-        reject(error);
-      }
-    });
+    req.on("end", () => resolve(raw));
     req.on("error", reject);
   });
+}
+
+function parseJsonBody(raw) {
+  if (!raw) return {};
+  return JSON.parse(raw);
 }
 
 function extractUserMessage(messages) {
@@ -138,6 +160,38 @@ function buildChatCompletionResponse({ body, result }) {
   };
 }
 
+function buildChatCompletionChunk({
+  id,
+  created,
+  model,
+  delta,
+  finishReason,
+}) {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    system_fingerprint: SYSTEM_FINGERPRINT,
+    choices: [
+      {
+        index: 0,
+        delta: delta || {},
+        logprobs: null,
+        finish_reason: finishReason ?? null,
+      },
+    ],
+  };
+}
+
+function writeSse(res, data) {
+  res.write(`data: ${data}\n\n`);
+}
+
+function writeSseJson(res, obj) {
+  writeSse(res, JSON.stringify(obj));
+}
+
 function createPageConversationClient(page, listener, sessionId) {
   const input = page
     .locator('div[contenteditable="true"][id="prompt-textarea"]')
@@ -159,6 +213,40 @@ function createPageConversationClient(page, listener, sessionId) {
     return listener.waitForNextFinalResponse({ timeoutMs: 180000 });
   }
 
+  async function runConversationStream(userText, onDelta) {
+    console.log(`\n[session:${sessionId}] [Q] ${userText}`);
+    listener.clearPending?.();
+    await sendMessage(userText);
+
+    let finalResult = null;
+    let finalError = null;
+    receiveFinalResult().then(
+      (final) => {
+        finalResult = final;
+      },
+      (error) => {
+        finalError = error;
+      },
+    );
+
+    while (!finalResult && !finalError) {
+      const delta = await listener.waitForNextDelta({ timeoutMs: 200 });
+      if (delta && typeof onDelta === "function") onDelta(delta);
+    }
+
+    if (finalError) throw finalError;
+    listener.cancelPendingDeltaWaiters?.();
+
+    while (true) {
+      const pending = await listener.waitForNextDelta({ timeoutMs: 0 });
+      if (!pending) break;
+      if (typeof onDelta === "function") onDelta(pending);
+    }
+
+    console.log(`[session:${sessionId}] [A] ${finalResult.text}`);
+    return finalResult;
+  }
+
   async function runConversation(userText) {
     console.log(`\n[session:${sessionId}] [Q] ${userText}`);
     await sendMessage(userText);
@@ -173,9 +261,16 @@ function createPageConversationClient(page, listener, sessionId) {
     return task;
   }
 
+  function enqueueConversationStream(userText, onDelta) {
+    const task = queue.then(() => runConversationStream(userText, onDelta));
+    queue = task.catch(() => undefined);
+    return task;
+  }
+
   return {
     waitUntilReady,
     runConversation: enqueueConversation,
+    runConversationStream: enqueueConversationStream,
   };
 }
 
@@ -222,19 +317,94 @@ function createApiServer({ port, context, conversationClient }) {
   });
 
   const server = http.createServer(async (req, res) => {
+    const apiRequestId = makeId("api");
+    const startedAt = Date.now();
+    const remoteAddress = req.socket?.remoteAddress || null;
+    const contentLengthHeader = req.headers["content-length"];
+    const contentLength =
+      typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : null;
+
+    logApi({
+      type: "api.request",
+      id: apiRequestId,
+      method: req.method,
+      url: req.url,
+      remoteAddress,
+      contentLength,
+      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
+    });
+
+    res.on("finish", () => {
+      logApi({
+        type: "api.response",
+        id: apiRequestId,
+        method: req.method,
+        url: req.url,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
+    res.on("close", () => {
+      if (res.writableEnded) return;
+      logApi({
+        type: "api.close",
+        id: apiRequestId,
+        method: req.method,
+        url: req.url,
+        statusCode: res.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+
     if (req.method === "GET" && req.url === "/health") {
       return jsonResponse(res, 200, { ok: true, sessions: sessions.size });
     }
 
     if (req.method === "POST" && req.url === "/v1/sessions") {
       try {
-        const body = await parseBody(req);
+        const raw = await readRawBody(req);
+        let body = {};
+        try {
+          body = parseJsonBody(raw);
+        } catch (error) {
+          logApi({
+            type: "api.body",
+            id: apiRequestId,
+            endpoint: "/v1/sessions",
+            parseOk: false,
+            rawLength: raw.length,
+            rawSnippet: API_LOG_BODY_SNIPPET
+              ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
+              : undefined,
+            message: error?.message || String(error),
+          });
+          return jsonResponse(res, 400, { error: "invalid json" });
+        }
+
+        logApi({
+          type: "api.body",
+          id: apiRequestId,
+          endpoint: "/v1/sessions",
+          parseOk: true,
+          rawLength: raw.length,
+          rawSnippet: API_LOG_BODY_SNIPPET
+            ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
+            : undefined,
+          hasChatUrl: typeof body?.chat_url === "string" && Boolean(body.chat_url),
+        });
         const chatUrl =
           typeof body.chat_url === "string" ? body.chat_url : NEW_CHAT_URL;
         const session = await createSession(context, chatUrl);
         sessions.set(session.id, session);
         return jsonResponse(res, 200, buildSessionResponse(session));
       } catch (error) {
+        logApi({
+          type: "api.error",
+          id: apiRequestId,
+          endpoint: "/v1/sessions",
+          message: error?.message || String(error),
+        });
         return jsonResponse(res, 500, {
           error: error?.message || String(error),
         });
@@ -246,38 +416,178 @@ function createApiServer({ port, context, conversationClient }) {
     }
 
     try {
-      const body = await parseBody(req);
-
-      if (body.stream === true) {
-        return jsonResponse(res, 400, {
-          error:
-            "stream=true is not supported; only final response is returned",
+      const raw = await readRawBody(req);
+      let body = {};
+      try {
+        body = parseJsonBody(raw);
+      } catch (error) {
+        logApi({
+          type: "api.body",
+          id: apiRequestId,
+          endpoint: "/v1/chat/completions",
+          parseOk: false,
+          rawLength: raw.length,
+          rawSnippet: API_LOG_BODY_SNIPPET
+            ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
+            : undefined,
+          message: error?.message || String(error),
         });
+        return jsonResponse(res, 400, { error: "invalid json" });
       }
 
       const userText = extractUserMessage(body.messages);
-      if (!userText) {
-        return jsonResponse(res, 400, { error: "missing user message" });
-      }
-
       const sessionId =
         typeof body.session_id === "string" && body.session_id
           ? body.session_id
           : "default";
+
+      logApi({
+        type: "api.body",
+        id: apiRequestId,
+        endpoint: "/v1/chat/completions",
+        parseOk: true,
+        rawLength: raw.length,
+        rawSnippet: API_LOG_BODY_SNIPPET
+          ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
+          : undefined,
+        model: typeof body?.model === "string" ? body.model : null,
+        stream: Boolean(body?.stream),
+        sessionId,
+        messagesCount: Array.isArray(body?.messages) ? body.messages.length : null,
+        promptTokens: estimatePromptTokens(body?.messages),
+        userText: API_LOG_USER_TEXT ? safeSnippet(userText, 240) : undefined,
+        userTextLength: userText.length,
+      });
+
+      if (!userText) {
+        logApi({
+          type: "api.reject",
+          id: apiRequestId,
+          endpoint: "/v1/chat/completions",
+          reason: "missing user message",
+        });
+        return jsonResponse(res, 400, { error: "missing user message" });
+      }
+
       const session = sessions.get(sessionId);
       if (!session) {
+        logApi({
+          type: "api.reject",
+          id: apiRequestId,
+          endpoint: "/v1/chat/completions",
+          reason: "session not found",
+          sessionId,
+        });
         return jsonResponse(res, 404, {
           error: `session not found: ${sessionId}`,
         });
       }
 
+      if (body.stream === true) {
+        res.writeHead(200, {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        });
+
+        const created = Math.floor(Date.now() / 1000);
+        const id = `chatcmpl-${Date.now()}`;
+        const model = body.model || DEFAULT_MODEL;
+
+        writeSseJson(
+          res,
+          buildChatCompletionChunk({
+            id,
+            created,
+            model,
+            delta: { role: "assistant" },
+          }),
+        );
+
+        let isClosed = false;
+        res.on("close", () => {
+          isClosed = true;
+        });
+
+        let streamedText = "";
+        const result = await session.conversationClient.runConversationStream(
+          userText,
+          STREAM_REALTIME_DELTAS
+            ? (delta) => {
+                streamedText += delta;
+                if (isClosed) return;
+                if (!delta) return;
+                writeSseJson(
+                  res,
+                  buildChatCompletionChunk({
+                    id,
+                    created,
+                    model,
+                    delta: { content: delta },
+                  }),
+                );
+              }
+            : null,
+        );
+
+        if (!isClosed && result.text) {
+          let finalDelta = "";
+          if (!STREAM_REALTIME_DELTAS || streamedText.length === 0) {
+            finalDelta = result.text;
+          } else if (result.text.startsWith(streamedText)) {
+            finalDelta = result.text.slice(streamedText.length);
+          } else if (streamedText !== result.text) {
+            logApi({
+              type: "api.stream_mismatch",
+              id: apiRequestId,
+              streamedLength: streamedText.length,
+              finalLength: result.text.length,
+              streamedText: API_LOG_USER_TEXT ? safeSnippet(streamedText, 240) : undefined,
+              finalText: API_LOG_USER_TEXT ? safeSnippet(result.text, 240) : undefined,
+            });
+          }
+
+          if (finalDelta) {
+            writeSseJson(
+              res,
+              buildChatCompletionChunk({
+                id,
+                created,
+                model,
+                delta: { content: finalDelta },
+              }),
+            );
+          }
+        }
+
+        if (!isClosed) {
+          writeSseJson(
+            res,
+            buildChatCompletionChunk({
+              id,
+              created,
+              model,
+              delta: {},
+              finishReason: result.finishReason || "stop",
+            }),
+          );
+          writeSse(res, "[DONE]");
+          res.end();
+        }
+
+        return;
+      }
+
       const result = await session.conversationClient.runConversation(userText);
-      return jsonResponse(
-        res,
-        200,
-        buildChatCompletionResponse({ body, result }),
-      );
+      return jsonResponse(res, 200, buildChatCompletionResponse({ body, result }));
     } catch (error) {
+      logApi({
+        type: "api.error",
+        id: apiRequestId,
+        endpoint: "/v1/chat/completions",
+        message: error?.message || String(error),
+      });
       return jsonResponse(res, 500, {
         error: error?.message || String(error),
       });
