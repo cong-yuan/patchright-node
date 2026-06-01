@@ -17,6 +17,8 @@ const API_LOG_USER_TEXT = (process.env.API_LOG_USER_TEXT || "1") !== "0";
 const API_LOG_BODY_SNIPPET = (process.env.API_LOG_BODY_SNIPPET || "0") !== "0";
 const API_LOG_BODY_MAX_CHARS = Number(process.env.API_LOG_BODY_MAX_CHARS || 4096);
 const STREAM_REALTIME_DELTAS = (process.env.STREAM_REALTIME_DELTAS || "0") === "1";
+const MAX_WEB_PROMPT_CHARS = Number(process.env.MAX_WEB_PROMPT_CHARS || 16000);
+const MAX_TOOL_RESULTS_CHARS = Number(process.env.MAX_TOOL_RESULTS_CHARS || 4000);
 
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -83,6 +85,283 @@ function extractUserMessage(messages) {
   return "";
 }
 
+function extractSystemMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter((m) => m?.role === "system" && typeof m?.content === "string" && m.content.trim())
+    .map((m) => m.content.trim());
+}
+
+function extractToolResultMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .filter((m) => m?.role === "tool")
+    .map((m) => {
+      const callId = typeof m?.tool_call_id === "string" ? m.tool_call_id : "";
+      const content = typeof m?.content === "string" ? m.content.trim() : "";
+      if (!content) return null;
+      return { callId, content };
+    })
+    .filter(Boolean);
+}
+
+function buildToolsInstruction(tools, toolChoice) {
+  if (!Array.isArray(tools) || tools.length === 0) return "";
+
+  const toolSpec = tools
+    .map((tool) => ({
+      type: tool?.type || "function",
+      function: {
+        name: tool?.function?.name || "",
+        description: tool?.function?.description || "",
+        parameters: tool?.function?.parameters || {},
+      },
+    }))
+    .filter((t) => t.function.name);
+
+  const choice =
+    typeof toolChoice === "string"
+      ? toolChoice
+      : toolChoice && typeof toolChoice === "object"
+        ? {
+            type: toolChoice.type || null,
+            function: {
+              name:
+                typeof toolChoice.function?.name === "string"
+                  ? toolChoice.function.name
+                  : null,
+            },
+          }
+        : "auto";
+
+  return [
+    "You are operating in OpenAI tool-calling compatibility mode.",
+    "If a tool should be called, output ONLY valid JSON with this exact shape:",
+    '{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
+    "If no tool is needed, answer normally in plain text.",
+    `tool_choice: ${JSON.stringify(choice)}`,
+    `tools: ${JSON.stringify(toolSpec)}`,
+  ].join("\n");
+}
+
+function buildCompactToolsInstruction(tools, toolChoice) {
+  if (!Array.isArray(tools) || tools.length === 0) return "";
+
+  const compact = tools
+    .map((tool) => {
+      const fn = tool?.function || {};
+      const props = fn?.parameters?.properties;
+      const propertyTypes =
+        props && typeof props === "object"
+          ? Object.fromEntries(
+              Object.entries(props).map(([k, v]) => [
+                k,
+                typeof v?.type === "string" ? v.type : "unknown",
+              ]),
+            )
+          : {};
+      return {
+        name: typeof fn.name === "string" ? fn.name : "",
+        description:
+          typeof fn.description === "string" ? safeSnippet(fn.description, 120) : "",
+        required: Array.isArray(fn?.parameters?.required) ? fn.parameters.required : [],
+        properties: propertyTypes,
+      };
+    })
+    .filter((x) => x.name);
+
+  const choice =
+    typeof toolChoice === "string"
+      ? toolChoice
+      : toolChoice && typeof toolChoice === "object"
+        ? `${toolChoice.type || "function"}:${toolChoice.function?.name || ""}`
+        : "auto";
+
+  return [
+    "Tool-calling mode. If calling tools, output ONLY JSON:",
+    '{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
+    `tool_choice: ${choice}`,
+    `tools: ${JSON.stringify(compact)}`,
+  ].join("\n");
+}
+
+function truncateToolResults(toolResults, maxChars) {
+  if (!Array.isArray(toolResults) || toolResults.length === 0) return [];
+  let remain = Math.max(0, maxChars);
+  const out = [];
+  for (const item of toolResults) {
+    if (remain <= 0) break;
+    const text = item.content || "";
+    const clipped = text.length > remain ? text.slice(0, remain) : text;
+    if (clipped) out.push({ ...item, content: clipped });
+    remain -= clipped.length;
+  }
+  return out;
+}
+
+function buildWebPromptFromOpenAiBody(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const userText = extractUserMessage(messages);
+  if (!userText) return "";
+
+  const systemMessages = extractSystemMessages(messages);
+  const toolResults = extractToolResultMessages(messages);
+  const toolsInstruction = buildToolsInstruction(body?.tools, body?.tool_choice);
+
+  const buildPrompt = (opts) => {
+    const sections = [];
+    if (systemMessages.length > 0) {
+      sections.push(`System:\n${systemMessages.join("\n\n")}`);
+    }
+    if (opts.toolsInstruction) {
+      sections.push(`Tooling Contract:\n${opts.toolsInstruction}`);
+    }
+    if (opts.toolResults.length > 0) {
+      sections.push(
+        `Tool Results:\n${opts.toolResults
+          .map((r) => `tool_call_id=${r.callId || "unknown"}\n${r.content}`)
+          .join("\n\n")}`,
+      );
+    }
+    sections.push(`User:\n${userText}`);
+    return sections.join("\n\n");
+  };
+
+  let prompt = buildPrompt({
+    toolsInstruction,
+    toolResults,
+  });
+  if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
+
+  prompt = buildPrompt({
+    toolsInstruction,
+    toolResults: truncateToolResults(toolResults, MAX_TOOL_RESULTS_CHARS),
+  });
+  if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
+
+  prompt = buildPrompt({
+    toolsInstruction: buildCompactToolsInstruction(body?.tools, body?.tool_choice),
+    toolResults: truncateToolResults(toolResults, Math.floor(MAX_TOOL_RESULTS_CHARS / 2)),
+  });
+  if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
+
+  return prompt.slice(0, MAX_WEB_PROMPT_CHARS);
+}
+
+function parseToolCallsFromAssistantText(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  const candidates = [trimmed];
+  const fencedMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch?.[1]) candidates.push(fencedMatch[1].trim());
+
+  for (const candidate of candidates) {
+    let parsed;
+    try {
+      parsed = JSON.parse(candidate);
+    } catch {
+      continue;
+    }
+
+    const calls = Array.isArray(parsed?.tool_calls)
+      ? parsed.tool_calls
+      : Array.isArray(parsed)
+        ? parsed
+        : null;
+    if (!calls || calls.length === 0) continue;
+
+    const normalized = calls
+      .map((c, idx) => {
+        const name = c?.name || c?.function?.name;
+        const argsObj =
+          c?.arguments && typeof c.arguments === "object"
+            ? c.arguments
+            : c?.function?.arguments && typeof c.function.arguments === "object"
+              ? c.function.arguments
+              : null;
+        const argsStr =
+          typeof c?.arguments === "string"
+            ? c.arguments
+            : typeof c?.function?.arguments === "string"
+              ? c.function.arguments
+              : argsObj
+                ? JSON.stringify(argsObj)
+                : "{}";
+        if (typeof name !== "string" || !name.trim()) return null;
+        return {
+          id: c?.id || `call_${Date.now()}_${idx}`,
+          type: "function",
+          function: {
+            name: name.trim(),
+            arguments: argsStr,
+          },
+        };
+      })
+      .filter(Boolean);
+
+    if (normalized.length > 0) return normalized;
+  }
+
+  return null;
+}
+
+function buildAssistantMessageFromResult(result) {
+  const toolCalls = parseToolCallsFromAssistantText(result?.text || "");
+  if (toolCalls) {
+    return {
+      content: null,
+      toolCalls,
+      finishReason: "tool_calls",
+      completionTextForUsage: JSON.stringify({ tool_calls: toolCalls }),
+    };
+  }
+
+  return {
+    content: result?.text || "",
+    toolCalls: null,
+    finishReason: result?.finishReason || "stop",
+    completionTextForUsage: result?.text || "",
+  };
+}
+
+function summarizeToolsForLog(tools) {
+  if (!Array.isArray(tools)) return [];
+
+  return tools.map((tool, index) => {
+    const fn = tool?.function && typeof tool.function === "object"
+      ? tool.function
+      : {};
+    const parameters = fn.parameters && typeof fn.parameters === "object"
+      ? fn.parameters
+      : null;
+
+    return {
+      index,
+      type: typeof tool?.type === "string" ? tool.type : null,
+      functionName: typeof fn.name === "string" ? fn.name : null,
+      functionDescription:
+        typeof fn.description === "string" ? safeSnippet(fn.description, 200) : null,
+      parameterKeys: parameters ? Object.keys(parameters) : [],
+    };
+  });
+}
+
+function summarizeToolChoiceForLog(toolChoice) {
+  if (toolChoice === undefined) return undefined;
+  if (typeof toolChoice === "string") return toolChoice;
+  if (!toolChoice || typeof toolChoice !== "object") return toolChoice;
+
+  return {
+    type: typeof toolChoice.type === "string" ? toolChoice.type : null,
+    functionName:
+      typeof toolChoice.function?.name === "string"
+        ? toolChoice.function.name
+        : null,
+  };
+}
+
 function estimateTokens(text) {
   if (!text) return 0;
   // Lightweight approximation to provide OpenAI-compatible usage fields.
@@ -112,11 +391,11 @@ function estimatePromptTokens(messages) {
 
 function buildChatCompletionResponse({ body, result }) {
   const created = Math.floor(Date.now() / 1000);
-  const answer = result.text;
+  const assistant = buildAssistantMessageFromResult(result);
   const model =
     body.model || result.resolvedModelSlug || result.modelSlug || DEFAULT_MODEL;
   const promptTokens = estimatePromptTokens(body.messages);
-  const completionTokens = estimateTokens(answer);
+  const completionTokens = estimateTokens(assistant.completionTextForUsage);
   const totalTokens = promptTokens + completionTokens;
 
   return {
@@ -135,11 +414,12 @@ function buildChatCompletionResponse({ body, result }) {
         index: 0,
         message: {
           role: "assistant",
-          content: answer,
+          content: assistant.content,
+          tool_calls: assistant.toolCalls || undefined,
           refusal: null,
         },
         logprobs: null,
-        finish_reason: result.finishReason || "stop",
+        finish_reason: assistant.finishReason,
       },
     ],
     usage: {
@@ -435,7 +715,7 @@ function createApiServer({ port, context, conversationClient }) {
         return jsonResponse(res, 400, { error: "invalid json" });
       }
 
-      const userText = extractUserMessage(body.messages);
+      const userText = buildWebPromptFromOpenAiBody(body);
       const sessionId =
         typeof body.session_id === "string" && body.session_id
           ? body.session_id
@@ -454,6 +734,9 @@ function createApiServer({ port, context, conversationClient }) {
         stream: Boolean(body?.stream),
         sessionId,
         messagesCount: Array.isArray(body?.messages) ? body.messages.length : null,
+        toolsCount: Array.isArray(body?.tools) ? body.tools.length : 0,
+        tools: summarizeToolsForLog(body?.tools),
+        toolChoice: summarizeToolChoiceForLog(body?.tool_choice),
         promptTokens: estimatePromptTokens(body?.messages),
         userText: API_LOG_USER_TEXT ? safeSnippet(userText, 240) : undefined,
         userTextLength: userText.length,
@@ -531,20 +814,21 @@ function createApiServer({ port, context, conversationClient }) {
             : null,
         );
 
-        if (!isClosed && result.text) {
+        const assistant = buildAssistantMessageFromResult(result);
+        if (!isClosed && assistant.content) {
           let finalDelta = "";
           if (!STREAM_REALTIME_DELTAS || streamedText.length === 0) {
-            finalDelta = result.text;
-          } else if (result.text.startsWith(streamedText)) {
-            finalDelta = result.text.slice(streamedText.length);
-          } else if (streamedText !== result.text) {
+            finalDelta = assistant.content;
+          } else if (assistant.content.startsWith(streamedText)) {
+            finalDelta = assistant.content.slice(streamedText.length);
+          } else if (streamedText !== assistant.content) {
             logApi({
               type: "api.stream_mismatch",
               id: apiRequestId,
               streamedLength: streamedText.length,
-              finalLength: result.text.length,
+              finalLength: assistant.content.length,
               streamedText: API_LOG_USER_TEXT ? safeSnippet(streamedText, 240) : undefined,
-              finalText: API_LOG_USER_TEXT ? safeSnippet(result.text, 240) : undefined,
+              finalText: API_LOG_USER_TEXT ? safeSnippet(assistant.content, 240) : undefined,
             });
           }
 
@@ -561,6 +845,18 @@ function createApiServer({ port, context, conversationClient }) {
           }
         }
 
+        if (!isClosed && assistant.toolCalls) {
+          writeSseJson(
+            res,
+            buildChatCompletionChunk({
+              id,
+              created,
+              model,
+              delta: { tool_calls: assistant.toolCalls },
+            }),
+          );
+        }
+
         if (!isClosed) {
           writeSseJson(
             res,
@@ -569,7 +865,7 @@ function createApiServer({ port, context, conversationClient }) {
               created,
               model,
               delta: {},
-              finishReason: result.finishReason || "stop",
+              finishReason: assistant.finishReason,
             }),
           );
           writeSse(res, "[DONE]");
