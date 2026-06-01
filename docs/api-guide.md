@@ -75,7 +75,41 @@ curl -s -X POST http://127.0.0.1:8787/v1/sessions \
 
 ---
 
-## 3.3 POST /v1/chat/completions
+## 3.3 DELETE /v1/sessions/{session_id}
+删除一个已创建的会话。
+
+### 说明
+- 删除普通 session：关闭其页面并移除会话。
+- 删除 `default`：会重建一个全新的 `default` 会话，返回 `200` 与 `reset: true`。
+- 如果 `session_id` 不存在，返回 `404`。
+
+### 请求示例
+```bash
+curl -s -X DELETE "http://127.0.0.1:8787/v1/sessions/${SESSION_ID}" | jq
+```
+
+### 响应示例
+```json
+{
+  "id": "sess_1748770000000_ab12cd",
+  "object": "session",
+  "deleted": true
+}
+```
+
+### 删除 default 响应示例
+```json
+{
+  "id": "default",
+  "object": "session",
+  "deleted": true,
+  "reset": true
+}
+```
+
+---
+
+## 3.4 POST /v1/chat/completions
 OpenAI 风格非流式聊天接口。输入用户消息，返回最终完整答案。
 
 ## 4. 请求字段

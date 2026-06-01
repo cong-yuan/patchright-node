@@ -548,6 +548,7 @@ function createPageConversationClient(page, listener, sessionId) {
   }
 
   return {
+    page,
     waitUntilReady,
     runConversation: enqueueConversation,
     runConversationStream: enqueueConversationStream,
@@ -587,12 +588,30 @@ function buildSessionResponse(session) {
   };
 }
 
-function createApiServer({ port, context, conversationClient }) {
+function parseDeleteSessionId(urlPath) {
+  if (!urlPath.startsWith("/v1/sessions/")) return null;
+  const encodedId = urlPath.slice("/v1/sessions/".length);
+  if (!encodedId) return null;
+  try {
+    return decodeURIComponent(encodedId);
+  } catch {
+    return null;
+  }
+}
+
+function createApiServer({
+  port,
+  context,
+  conversationClient,
+  defaultPage,
+  createSessionFn = createSession,
+}) {
   const sessions = new Map();
   sessions.set("default", {
     id: "default",
     created: Math.floor(Date.now() / 1000),
     chatUrl: CHAT_URL,
+    page: defaultPage || null,
     conversationClient,
   });
 
@@ -675,7 +694,7 @@ function createApiServer({ port, context, conversationClient }) {
         });
         const chatUrl =
           typeof body.chat_url === "string" ? body.chat_url : NEW_CHAT_URL;
-        const session = await createSession(context, chatUrl);
+        const session = await createSessionFn(context, chatUrl);
         sessions.set(session.id, session);
         return jsonResponse(res, 200, buildSessionResponse(session));
       } catch (error) {
@@ -688,6 +707,84 @@ function createApiServer({ port, context, conversationClient }) {
         return jsonResponse(res, 500, {
           error: error?.message || String(error),
         });
+      }
+    }
+
+    if (req.method === "DELETE") {
+      const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
+      const sessionId = parseDeleteSessionId(reqUrl.pathname);
+      if (sessionId) {
+        if (sessionId === "default") {
+          try {
+            const prev = sessions.get("default");
+            const chatUrl = prev?.chatUrl || CHAT_URL;
+            const page = await context.newPage();
+            const listener = await attachConversationStreamListener(page, {
+              debug: false,
+            });
+            await page.goto(chatUrl, { waitUntil: "domcontentloaded" });
+            const newDefaultClient = createPageConversationClient(
+              page,
+              listener,
+              "default",
+            );
+            await newDefaultClient.waitUntilReady();
+            sessions.set("default", {
+              id: "default",
+              created: Math.floor(Date.now() / 1000),
+              chatUrl,
+              page,
+              conversationClient: newDefaultClient,
+            });
+            if (prev?.page && typeof prev.page.close === "function") {
+              try {
+                await prev.page.close();
+              } catch (error) {
+                logApi({
+                  type: "api.error",
+                  id: apiRequestId,
+                  endpoint: "/v1/sessions/:id",
+                  message: error?.message || String(error),
+                  sessionId: "default",
+                });
+              }
+            }
+            return jsonResponse(res, 200, {
+              id: "default",
+              object: "session",
+              deleted: true,
+              reset: true,
+            });
+          } catch (error) {
+            return jsonResponse(res, 500, {
+              error: error?.message || String(error),
+            });
+          }
+        }
+
+        const session = sessions.get(sessionId);
+        if (!session) {
+          return jsonResponse(res, 404, {
+            error: `session not found: ${sessionId}`,
+          });
+        }
+
+        sessions.delete(sessionId);
+        if (session.page && typeof session.page.close === "function") {
+          try {
+            await session.page.close();
+          } catch (error) {
+            logApi({
+              type: "api.error",
+              id: apiRequestId,
+              endpoint: "/v1/sessions/:id",
+              message: error?.message || String(error),
+              sessionId,
+            });
+          }
+        }
+
+        return jsonResponse(res, 200, { id: sessionId, object: "session", deleted: true });
       }
     }
 
@@ -919,10 +1016,19 @@ async function main() {
     "default",
   );
   await conversationClient.waitUntilReady();
-  createApiServer({ port: PORT, context, conversationClient });
+  createApiServer({ port: PORT, context, conversationClient, defaultPage: page });
 }
 
-main().catch((error) => {
-  console.error("[fatal]", error?.stack || error?.message || String(error));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("[fatal]", error?.stack || error?.message || String(error));
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  createApiServer,
+  createSession,
+  createPageConversationClient,
+  buildWebPromptFromOpenAiBody,
+};
