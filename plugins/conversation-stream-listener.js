@@ -3,33 +3,16 @@ function attachConversationStreamListener(target, options = {}) {
     options.targetPattern || /\/backend-api\/f\/conversation(?:$|[/?#])/;
   const wsPattern =
     options.wsPattern || /chatgpt\.com|chat\.openai\.com|\/backend-api\//;
-  const debug = Boolean(options.debug);
-  const printFinal = Boolean(options.printFinal);
-  const onFinalResponse =
-    typeof options.onFinalResponse === "function" ? options.onFinalResponse : null;
 
   const streamState = {
     lastRealtimeOutputAt: 0,
     streams: new Map(),
-    pendingFinalTexts: [],
+    pendingFinalResponses: [],
     waiters: [],
   };
 
-  attachFetchStreamListener(target, targetPattern, streamState, debug, {
-    printFinal,
-    onFinalResponse,
-  });
+  attachFetchStreamListener(target, targetPattern, streamState);
 
-  target.on("request", async (request) => {
-    const url = request.url();
-    if (!targetPattern.test(url)) return;
-
-    const body = request.postData() || "";
-    const q = extractUserText(body);
-    if (q) console.log(`\n[Q] ${q}`);
-  });
-
-  // HTTP fallback when page-side realtime stream capture fails.
   target.on("response", async (response) => {
     const url = response.url();
     if (!targetPattern.test(url)) return;
@@ -39,24 +22,11 @@ function attachConversationStreamListener(target, options = {}) {
       if (Date.now() - streamState.lastRealtimeOutputAt < 5000) return;
 
       const events = parseSseEvents(bodyText);
-      let finalText = "";
+      const state = createStreamState();
+      for (const evt of events) consumeSseEvent(state, evt, streamState);
 
-      for (const evt of events) {
-        const text = extractAssistantTextFromEvent(evt);
-        if (!text) continue;
-        finalText += text;
-      }
-
-      if (finalText.trim()) {
-        emitFinalResponse(finalText, streamState, {
-          printFinal,
-          onFinalResponse,
-          source: "response-fallback",
-        });
-      }
-    } catch (error) {
-      console.error("[stream][error]", error.message || error);
-    }
+      if (state.fullText.trim()) emitFinalResponse(buildFinalResult(state), streamState);
+    } catch {}
   });
 
   target.on("websocket", (ws) => {
@@ -67,14 +37,10 @@ function attachConversationStreamListener(target, options = {}) {
       if (typeof payload !== "string") return;
 
       const events = parseSseEvents(payload);
-      let frameText = "";
       for (const evt of events) {
         const text = extractAssistantTextFromEvent(evt);
-        if (!text) continue;
-        frameText += text;
+        if (text) streamState.lastRealtimeOutputAt = Date.now();
       }
-
-      if (frameText) streamState.lastRealtimeOutputAt = Date.now();
     });
   });
 
@@ -84,20 +50,32 @@ function attachConversationStreamListener(target, options = {}) {
   };
 }
 
-async function attachFetchStreamListener(
-  target,
-  targetPattern,
-  streamState,
-  debug,
-  emitOptions,
-) {
+function createStreamState() {
+  return {
+    buffer: "",
+    fullText: "",
+    meta: {
+      conversationId: null,
+      inputMessageId: null,
+      assistantMessageId: null,
+      requestId: null,
+      turnExchangeId: null,
+      turnTraceId: null,
+      resolvedModelSlug: null,
+      modelSlug: null,
+      finishReason: null,
+    },
+  };
+}
+
+async function attachFetchStreamListener(target, targetPattern, streamState) {
   try {
     if (!target.exposeBinding || !target.addInitScript) return;
 
     const bindingName = "__conversationStreamListenerChunk";
 
     await target.exposeBinding(bindingName, (_source, payload) => {
-      handleRealtimePayload(payload, streamState, emitOptions);
+      handleRealtimePayload(payload, streamState);
     });
 
     await target.addInitScript(
@@ -133,23 +111,13 @@ async function attachFetchStreamListener(
 
                 const text = decoder.decode(value, { stream: true });
                 if (text) {
-                  window[pageBindingName]({
-                    type: "chunk",
-                    id: streamId,
-                    url,
-                    text,
-                  });
+                  window[pageBindingName]({ type: "chunk", id: streamId, url, text });
                 }
               }
 
               const tail = decoder.decode();
               if (tail) {
-                window[pageBindingName]({
-                  type: "chunk",
-                  id: streamId,
-                  url,
-                  text: tail,
-                });
+                window[pageBindingName]({ type: "chunk", id: streamId, url, text: tail });
               }
 
               window[pageBindingName]({ type: "done", id: streamId, url });
@@ -178,20 +146,14 @@ async function attachFetchStreamListener(
         patternFlags: targetPattern.flags.replace(/[gy]/g, ""),
       },
     );
-    if (debug) console.log("[stream][debug] fetch stream hook installed");
-  } catch (error) {
-    if (debug) console.error("[stream][debug] fetch stream hook failed", error);
-  }
+  } catch {}
 }
 
-function handleRealtimePayload(payload, streamState, emitOptions) {
+function handleRealtimePayload(payload, streamState) {
   if (!payload || typeof payload !== "object") return;
 
   if (payload.type === "start") {
-    streamState.streams.set(payload.id, {
-      buffer: "",
-      fullText: "",
-    });
+    streamState.streams.set(payload.id, createStreamState());
     return;
   }
 
@@ -205,14 +167,7 @@ function handleRealtimePayload(payload, streamState, emitOptions) {
 
   if (payload.type === "done" || payload.type === "error") {
     consumeSseChunk(state, "\n\n", streamState);
-
-    if (state.fullText.trim()) {
-      emitFinalResponse(state.fullText, streamState, {
-        ...emitOptions,
-        source: payload.type,
-      });
-    }
-
+    if (state.fullText.trim()) emitFinalResponse(buildFinalResult(state), streamState);
     streamState.streams.delete(payload.id);
   }
 }
@@ -230,38 +185,142 @@ function consumeSseChunk(state, chunk, streamState) {
     state.buffer = state.buffer.slice(boundary.end);
 
     const events = parseSseEvents(block);
-    for (const evt of events) {
-      const text = extractAssistantTextFromEvent(evt);
-      if (!text) continue;
-
-      state.fullText += text;
-      streamState.lastRealtimeOutputAt = Date.now();
-    }
+    for (const evt of events) consumeSseEvent(state, evt, streamState);
   }
 }
 
-function emitFinalResponse(text, streamState, options = {}) {
-  const finalText = (text || "").trim();
-  if (!finalText) return;
-
-  if (options.printFinal) console.log(`[A] ${finalText}`);
-  if (typeof options.onFinalResponse === "function") {
-    options.onFinalResponse(finalText, { source: options.source || "unknown" });
+function consumeSseEvent(state, evt, streamState) {
+  const text = extractAssistantTextFromEvent(evt);
+  if (text) {
+    state.fullText += text;
+    streamState.lastRealtimeOutputAt = Date.now();
   }
+
+  const metaPatch = extractMetaFromEvent(evt);
+  mergeMeta(state.meta, metaPatch);
+}
+
+function extractMetaFromEvent(evt) {
+  if (!evt || typeof evt.data !== "string") return {};
+
+  let payload;
+  try {
+    payload = JSON.parse(evt.data);
+  } catch {
+    return {};
+  }
+
+  const meta = {};
+
+  if (typeof payload.conversation_id === "string") {
+    meta.conversationId = payload.conversation_id;
+  }
+
+  if (payload.type === "input_message" && payload.input_message) {
+    if (typeof payload.input_message.id === "string") {
+      meta.inputMessageId = payload.input_message.id;
+    }
+
+    const md = payload.input_message.metadata;
+    if (md && typeof md === "object") {
+      if (typeof md.request_id === "string") meta.requestId = md.request_id;
+      if (typeof md.turn_exchange_id === "string") {
+        meta.turnExchangeId = md.turn_exchange_id;
+      }
+      if (typeof md.turn_trace_id === "string") meta.turnTraceId = md.turn_trace_id;
+      if (typeof md.resolved_model_slug === "string") {
+        meta.resolvedModelSlug = md.resolved_model_slug;
+      }
+    }
+  }
+
+  if (payload.type === "server_ste_metadata" && payload.metadata) {
+    const md = payload.metadata;
+    if (typeof md.request_id === "string") meta.requestId = md.request_id;
+    if (typeof md.turn_exchange_id === "string") meta.turnExchangeId = md.turn_exchange_id;
+    if (typeof md.turn_trace_id === "string") meta.turnTraceId = md.turn_trace_id;
+    if (typeof md.model_slug === "string") meta.modelSlug = md.model_slug;
+  }
+
+  if (payload?.v?.message && typeof payload.v.message === "object") {
+    const msg = payload.v.message;
+    if (typeof msg.id === "string") meta.assistantMessageId = msg.id;
+
+    const md = msg.metadata;
+    if (md && typeof md === "object") {
+      if (typeof md.request_id === "string") meta.requestId = md.request_id;
+      if (typeof md.turn_exchange_id === "string") meta.turnExchangeId = md.turn_exchange_id;
+      if (typeof md.model_slug === "string") meta.modelSlug = md.model_slug;
+      if (typeof md.resolved_model_slug === "string") {
+        meta.resolvedModelSlug = md.resolved_model_slug;
+      }
+    }
+  }
+
+  if (payload.o === "patch" && Array.isArray(payload.v)) {
+    for (const op of payload.v) {
+      if (op?.p === "/message/status" && op?.v === "finished_successfully") {
+        meta.finishReason = "stop";
+      }
+      if (op?.p === "/message/metadata" && op?.o === "append") {
+        const finishType = op?.v?.finish_details?.type;
+        if (typeof finishType === "string") meta.finishReason = normalizeFinishReason(finishType);
+      }
+    }
+  }
+
+  if (payload.type === "message_stream_complete" && !meta.finishReason) {
+    meta.finishReason = "stop";
+  }
+
+  return meta;
+}
+
+function mergeMeta(target, patch) {
+  for (const [key, value] of Object.entries(patch || {})) {
+    if (value !== null && value !== undefined && value !== "") target[key] = value;
+  }
+}
+
+function normalizeFinishReason(raw) {
+  if (raw === "stop") return "stop";
+  if (raw === "length") return "length";
+  if (raw === "content_filter") return "content_filter";
+  if (raw === "tool_calls") return "tool_calls";
+  return "stop";
+}
+
+function buildFinalResult(state) {
+  const meta = state.meta || {};
+  return {
+    text: (state.fullText || "").trim(),
+    conversationId: meta.conversationId || null,
+    inputMessageId: meta.inputMessageId || null,
+    assistantMessageId: meta.assistantMessageId || null,
+    requestId: meta.requestId || null,
+    turnExchangeId: meta.turnExchangeId || null,
+    turnTraceId: meta.turnTraceId || null,
+    resolvedModelSlug: meta.resolvedModelSlug || null,
+    modelSlug: meta.modelSlug || null,
+    finishReason: meta.finishReason || "stop",
+  };
+}
+
+function emitFinalResponse(finalResponse, streamState) {
+  if (!finalResponse || !finalResponse.text) return;
 
   const waiter = streamState.waiters.shift();
   if (waiter) {
-    waiter.resolve({ text: finalText });
+    waiter.resolve(finalResponse);
     return;
   }
 
-  streamState.pendingFinalTexts.push(finalText);
+  streamState.pendingFinalResponses.push(finalResponse);
 }
 
 function waitForNextFinalResponse(streamState, timeoutMs) {
-  if (streamState.pendingFinalTexts.length > 0) {
-    const text = streamState.pendingFinalTexts.shift();
-    return Promise.resolve({ text });
+  if (streamState.pendingFinalResponses.length > 0) {
+    return Promise.resolve(streamState.pendingFinalResponses.shift());
   }
 
   return new Promise((resolve, reject) => {
@@ -314,9 +373,7 @@ function parseSseEvents(raw) {
         continue;
       }
 
-      if (line.startsWith("data:")) {
-        dataLines.push(line.slice(5).trim());
-      }
+      if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
     }
 
     if (dataLines.length === 0) continue;
@@ -331,7 +388,6 @@ function parseSseEvents(raw) {
 
 function extractAssistantTextFromEvent(evt) {
   if (!evt || typeof evt.data !== "string") return "";
-
   if (evt.event !== "delta" && evt.event !== "message") return "";
 
   try {
@@ -346,7 +402,6 @@ function extractTextFromDeltaLike(obj) {
   if (!obj || typeof obj !== "object") return "";
 
   if (typeof obj.v === "string") return obj.v;
-
   if (obj.o === "append" && typeof obj.v === "string") return obj.v;
 
   if (obj.o === "patch" && Array.isArray(obj.v)) {
@@ -375,23 +430,6 @@ function extractTextFromDeltaLike(obj) {
   return "";
 }
 
-function extractUserText(rawBody) {
-  try {
-    const body = JSON.parse(rawBody);
-    const msg = Array.isArray(body?.messages)
-      ? [...body.messages].reverse().find((m) => m?.author?.role === "user")
-      : null;
-    if (!msg) return "";
-
-    return (
-      flattenText(msg?.content?.parts) ||
-      (typeof msg?.content?.text === "string" ? msg.content.text : "")
-    );
-  } catch {
-    return "";
-  }
-}
-
 function flattenText(parts) {
   if (!Array.isArray(parts)) return "";
 
@@ -403,7 +441,6 @@ function flattenText(parts) {
     }
 
     if (!part || typeof part !== "object") continue;
-
     if (typeof part.text === "string") out.push(part.text);
     if (typeof part.content === "string") out.push(part.content);
     if (Array.isArray(part.parts)) out.push(flattenText(part.parts));
