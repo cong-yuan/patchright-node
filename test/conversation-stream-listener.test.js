@@ -227,6 +227,7 @@ test("buildWebPromptFromOpenAiBody uses a short strict tool-calling prompt", () 
     },
   );
 
+  assert.match(prompt, /Prefer using available tools whenever a relevant tool can verify facts/);
   assert.match(prompt, /Before any tool call, identify the dependency graph/);
   assert.match(prompt, /Never invent intermediate values or skip required steps/);
   assert.ok(prompt.length < 2000);

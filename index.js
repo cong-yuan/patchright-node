@@ -261,6 +261,7 @@ function buildCompactToolsInstruction(tools, toolChoice) {
 
   return [
     TOOL_CALLING_PROMPT,
+    "Prefer using available tools whenever a relevant tool can verify facts, inspect state, or complete a step more reliably than guessing.",
     'Use this shape: {"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
     `tool_choice: ${choice}`,
     `tools: ${JSON.stringify(compact)}`,
