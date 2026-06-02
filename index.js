@@ -1,19 +1,27 @@
 const http = require("http");
 const fs = require("node:fs/promises");
+const fsSync = require("node:fs");
 const path = require("node:path");
 const { chromium } = require("patchright");
+const { JsonSessionStore } = require("./session-store");
+const { SessionManager } = require("./session-manager");
 const {
   attachConversationStreamListener,
 } = require("./plugins/conversation-stream-listener");
 
-const CHAT_URL =
-  process.env.CHAT_URL ||
-  "https://chatgpt.com/c/WEB:5131f56b-a35c-4e1c-bfe7-7f2b9d83a385";
+const CHAT_URL = process.env.CHAT_URL || "https://chatgpt.com";
 const PORT = Number(process.env.PORT || 8989);
 const DEFAULT_MODEL = process.env.MODEL_NAME || "chatgpt-web-proxy";
 const SYSTEM_FINGERPRINT =
   process.env.SYSTEM_FINGERPRINT || "fp_patchright_node_proxy_v1";
 const NEW_CHAT_URL = process.env.NEW_CHAT_URL || "https://chatgpt.com/";
+const ACCOUNT_UUID = process.env.ACCOUNT_UUID || "default_account";
+const ACCOUNT_STORAGE_ROOT =
+  process.env.ACCOUNT_STORAGE_ROOT ||
+  path.join(process.cwd(), "user-data", "accounts");
+const SESSION_STORE_FILE =
+  process.env.SESSION_STORE_FILE ||
+  path.join(process.cwd(), "data", "sessions.json");
 const API_LOG = (process.env.API_LOG || "1") !== "0";
 const API_LOG_USER_TEXT = (process.env.API_LOG_USER_TEXT || "1") !== "0";
 const API_LOG_BODY_SNIPPET = (process.env.API_LOG_BODY_SNIPPET || "0") !== "0";
@@ -38,6 +46,9 @@ const ONLY_LAST_MESSAGE_IN_WEB_PROMPT = (() => {
 const CHAT_COMPLETION_REQUEST_LOG_FILE =
   process.env.CHAT_COMPLETION_REQUEST_LOG_FILE ||
   path.join(process.cwd(), "logs", "chat-completions.jsonl");
+const TOOL_CALLING_PROMPT = fsSync
+  .readFileSync(path.join(__dirname, "prompts", "tool-calling.txt"), "utf8")
+  .trim();
 
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -203,9 +214,8 @@ function buildToolsInstruction(tools, toolChoice) {
         : "auto";
 
   return [
-    "You are operating in OpenAI tool-calling compatibility mode.",
-    "If a tool should be called, output ONLY valid JSON with this exact shape:",
-    '{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
+    TOOL_CALLING_PROMPT,
+    'Use this shape: {"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
     "If no tool is needed, answer normally in plain text.",
     `tool_choice: ${JSON.stringify(choice)}`,
     `tools: ${JSON.stringify(toolSpec)}`,
@@ -250,8 +260,8 @@ function buildCompactToolsInstruction(tools, toolChoice) {
         : "auto";
 
   return [
-    "Tool-calling mode. If calling tools, output ONLY JSON:",
-    '{"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
+    TOOL_CALLING_PROMPT,
+    'Use this shape: {"tool_calls":[{"name":"<tool_name>","arguments":{}}]}',
     `tool_choice: ${choice}`,
     `tools: ${JSON.stringify(compact)}`,
   ].join("\n");
@@ -271,7 +281,12 @@ function truncateToolResults(toolResults, maxChars) {
   return out;
 }
 
-function buildPromptSections({ systemMessages, toolsInstruction, toolResults, lastMessageText }) {
+function buildPromptSections({
+  systemMessages,
+  toolsInstruction,
+  toolResults,
+  lastMessageText,
+}) {
   const sections = [];
   if (systemMessages.length > 0) {
     sections.push(`System:\n${systemMessages.join("\n\n")}`);
@@ -567,11 +582,12 @@ function createPageConversationClient(page, listener, sessionId) {
   const input = page
     .locator('div[contenteditable="true"][id="prompt-textarea"]')
     .first();
+  const pageReadyTimeoutMs = Number(process.env.PAGE_READY_TIMEOUT_MS || 30000);
 
   let queue = Promise.resolve();
 
   async function waitUntilReady() {
-    await input.waitFor({ state: "visible", timeout: 30000 });
+    await input.waitFor({ state: "visible", timeout: pageReadyTimeoutMs });
   }
 
   async function sendMessage(userText) {
@@ -671,11 +687,16 @@ async function createSession(context, chatUrl) {
 
 function buildSessionResponse(session) {
   return {
-    id: session.id,
+    id: session.tabSessionId || session.id,
     object: "session",
-    created: session.created,
-    status: "ready",
-    chat_url: session.chatUrl,
+    created: session.createdAt
+      ? Math.floor(new Date(session.createdAt).getTime() / 1000)
+      : session.created || Math.floor(Date.now() / 1000),
+    status: session.status || "ready",
+    account_uuid: session.accountUuid || null,
+    tab_session_id: session.tabSessionId || null,
+    web_session_id: session.webSessionId || null,
+    chat_url: session.chatUrl || null,
   };
 }
 
@@ -690,22 +711,10 @@ function parseDeleteSessionId(urlPath) {
   }
 }
 
-function createApiServer({
-  port,
-  context,
-  conversationClient,
-  defaultPage,
-  createSessionFn = createSession,
-}) {
-  const sessions = new Map();
-  sessions.set("default", {
-    id: "default",
-    created: Math.floor(Date.now() / 1000),
-    chatUrl: CHAT_URL,
-    page: defaultPage || null,
-    conversationClient,
-  });
-
+function createApiServer({ port, sessionManager }) {
+  if (!sessionManager) {
+    throw new TypeError("sessionManager is required");
+  }
   const server = http.createServer(async (req, res) => {
     const apiRequestId = makeId("api");
     const startedAt = Date.now();
@@ -753,7 +762,11 @@ function createApiServer({
     });
 
     if (req.method === "GET" && req.url === "/health") {
-      return jsonResponse(res, 200, { ok: true, sessions: sessions.size });
+      const sessions =
+        typeof sessionManager.store?.listSessions === "function"
+          ? sessionManager.store.listSessions()
+          : [];
+      return jsonResponse(res, 200, { ok: true, sessions: sessions.length });
     }
 
     if (req.method === "POST" && req.url === "/v1/sessions") {
@@ -786,13 +799,24 @@ function createApiServer({
           rawSnippet: API_LOG_BODY_SNIPPET
             ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
             : undefined,
+          accountUuid:
+            typeof body?.account_uuid === "string" && body.account_uuid
+              ? body.account_uuid
+              : ACCOUNT_UUID,
           hasChatUrl:
             typeof body?.chat_url === "string" && Boolean(body.chat_url),
         });
         const chatUrl =
           typeof body.chat_url === "string" ? body.chat_url : NEW_CHAT_URL;
-        const session = await createSessionFn(context, chatUrl);
-        sessions.set(session.id, session);
+        const accountUuid =
+          typeof body.account_uuid === "string" && body.account_uuid
+            ? body.account_uuid
+            : ACCOUNT_UUID;
+        const session = await sessionManager.createSession({
+          accountUuid,
+          chatUrl,
+          isDefault: Boolean(body?.is_default),
+        });
         return jsonResponse(res, 200, buildSessionResponse(session));
       } catch (error) {
         logApi({
@@ -811,81 +835,31 @@ function createApiServer({
       const reqUrl = new URL(req.url || "/", "http://127.0.0.1");
       const sessionId = parseDeleteSessionId(reqUrl.pathname);
       if (sessionId) {
-        if (sessionId === "default") {
-          try {
-            const prev = sessions.get("default");
-            const chatUrl = prev?.chatUrl || CHAT_URL;
-            const page = await context.newPage();
-            const listener = await attachConversationStreamListener(page, {
-              debug: false,
-            });
-            await page.goto(chatUrl, { waitUntil: "domcontentloaded" });
-            const newDefaultClient = createPageConversationClient(
-              page,
-              listener,
-              "default",
-            );
-            await newDefaultClient.waitUntilReady();
-            sessions.set("default", {
-              id: "default",
-              created: Math.floor(Date.now() / 1000),
-              chatUrl,
-              page,
-              conversationClient: newDefaultClient,
-            });
-            if (prev?.page && typeof prev.page.close === "function") {
-              try {
-                await prev.page.close();
-              } catch (error) {
-                logApi({
-                  type: "api.error",
-                  id: apiRequestId,
-                  endpoint: "/v1/sessions/:id",
-                  message: error?.message || String(error),
-                  sessionId: "default",
-                });
-              }
-            }
-            return jsonResponse(res, 200, {
-              id: "default",
-              object: "session",
-              deleted: true,
-              reset: true,
-            });
-          } catch (error) {
-            return jsonResponse(res, 500, {
-              error: error?.message || String(error),
-            });
-          }
-        }
-
-        const session = sessions.get(sessionId);
-        if (!session) {
+        const resolved = await sessionManager.resolveSessionRef(sessionId);
+        if (!resolved) {
           return jsonResponse(res, 404, {
             error: `session not found: ${sessionId}`,
           });
         }
 
-        sessions.delete(sessionId);
-        if (session.page && typeof session.page.close === "function") {
-          try {
-            await session.page.close();
-          } catch (error) {
-            logApi({
-              type: "api.error",
-              id: apiRequestId,
-              endpoint: "/v1/sessions/:id",
-              message: error?.message || String(error),
-              sessionId,
-            });
-          }
+        const result = await sessionManager.deleteSession(sessionId);
+        if (!result) {
+          return jsonResponse(res, 404, {
+            error: `session not found: ${sessionId}`,
+          });
         }
 
-        return jsonResponse(res, 200, {
-          id: sessionId,
+        const deletedSession = result.deletedSession || resolved;
+        const payload = {
+          id: deletedSession.tabSessionId || sessionId,
           object: "session",
           deleted: true,
-        });
+          closed: true,
+        };
+        if (result.resetSession) {
+          payload.reset = true;
+        }
+        return jsonResponse(res, 200, payload);
       }
     }
 
@@ -969,7 +943,7 @@ function createApiServer({
         return jsonResponse(res, 400, { error: "missing user message" });
       }
 
-      const session = sessions.get(sessionId);
+      const session = await sessionManager.resolveSessionRef(sessionId);
       if (!session) {
         logApi({
           type: "api.reject",
@@ -1011,7 +985,8 @@ function createApiServer({
         });
 
         let streamedText = "";
-        const result = await session.conversationClient.runConversationStream(
+        const { result } = await sessionManager.runConversationStream(
+          sessionId,
           userText,
           STREAM_REALTIME_DELTAS
             ? (delta) => {
@@ -1096,7 +1071,10 @@ function createApiServer({
         return;
       }
 
-      const result = await session.conversationClient.runConversation(userText);
+      const { result } = await sessionManager.runConversation(
+        sessionId,
+        userText,
+      );
       return jsonResponse(
         res,
         200,
@@ -1125,30 +1103,32 @@ function createApiServer({
 }
 
 async function main() {
-  const context = await chromium.launchPersistentContext("./user-data", {
-    channel: "chrome",
-    headless: false,
-    viewport: null,
+  const store = new JsonSessionStore({ filePath: SESSION_STORE_FILE });
+  await store.load();
+
+  const sessionManager = new SessionManager({
+    store,
+    launchAccountContext: async (accountUuid, { userDataDir }) => {
+      const dir = userDataDir || path.join(ACCOUNT_STORAGE_ROOT, accountUuid);
+      return chromium.launchPersistentContext(dir, {
+        channel: "chrome",
+        headless: false,
+        viewport: null,
+      });
+    },
+    createConversationClient: createPageConversationClient,
+    defaultAccountUuid: ACCOUNT_UUID,
+    defaultChatUrl: CHAT_URL,
+    newChatUrl: NEW_CHAT_URL,
+    accountStorageRoot: ACCOUNT_STORAGE_ROOT,
   });
 
-  const page = await context.newPage();
-  const listener = await attachConversationStreamListener(page, {
-    debug: false,
-  });
+  await sessionManager.init();
+  await sessionManager.ensureDefaultSession(ACCOUNT_UUID);
 
-  await page.goto(CHAT_URL, { waitUntil: "domcontentloaded" });
-
-  const conversationClient = createPageConversationClient(
-    page,
-    listener,
-    "default",
-  );
-  await conversationClient.waitUntilReady();
   createApiServer({
     port: PORT,
-    context,
-    conversationClient,
-    defaultPage: page,
+    sessionManager,
   });
 }
 
@@ -1165,4 +1145,6 @@ module.exports = {
   createPageConversationClient,
   buildWebPromptFromOpenAiBody,
   logChatCompletionRequest,
+  JsonSessionStore,
+  SessionManager,
 };

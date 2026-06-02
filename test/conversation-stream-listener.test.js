@@ -198,6 +198,40 @@ test("buildWebPromptFromOpenAiBody keeps tools when onlyLastUserMessage is enabl
   assert.match(prompt, /tool_choice:/);
 });
 
+test("buildWebPromptFromOpenAiBody uses a short strict tool-calling prompt", () => {
+  const prompt = buildWebPromptFromOpenAiBody(
+    {
+      messages: [{ role: "user", content: "计算 1+1" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "calculator",
+            description: "calculate expressions",
+            parameters: {
+              type: "object",
+              properties: {
+                a: { type: "number" },
+                b: { type: "number" },
+                operation: { type: "string" },
+              },
+            },
+          },
+        },
+      ],
+      tool_choice: "auto",
+    },
+    {
+      onlyLastUserMessage: true,
+      includeToolsInstruction: true,
+    },
+  );
+
+  assert.match(prompt, /Before any tool call, identify the dependency graph/);
+  assert.match(prompt, /Never invent intermediate values or skip required steps/);
+  assert.ok(prompt.length < 2000);
+});
+
 test("logChatCompletionRequest writes the full request body to jsonl", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "patchright-log-"));
   const logFilePath = path.join(tmpDir, "chat-completions.jsonl");
