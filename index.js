@@ -1,4 +1,6 @@
 const http = require("http");
+const fs = require("node:fs/promises");
+const path = require("node:path");
 const { chromium } = require("patchright");
 const {
   attachConversationStreamListener,
@@ -7,7 +9,7 @@ const {
 const CHAT_URL =
   process.env.CHAT_URL ||
   "https://chatgpt.com/c/WEB:5131f56b-a35c-4e1c-bfe7-7f2b9d83a385";
-const PORT = Number(process.env.PORT || 8787);
+const PORT = Number(process.env.PORT || 8989);
 const DEFAULT_MODEL = process.env.MODEL_NAME || "chatgpt-web-proxy";
 const SYSTEM_FINGERPRINT =
   process.env.SYSTEM_FINGERPRINT || "fp_patchright_node_proxy_v1";
@@ -15,10 +17,27 @@ const NEW_CHAT_URL = process.env.NEW_CHAT_URL || "https://chatgpt.com/";
 const API_LOG = (process.env.API_LOG || "1") !== "0";
 const API_LOG_USER_TEXT = (process.env.API_LOG_USER_TEXT || "1") !== "0";
 const API_LOG_BODY_SNIPPET = (process.env.API_LOG_BODY_SNIPPET || "0") !== "0";
-const API_LOG_BODY_MAX_CHARS = Number(process.env.API_LOG_BODY_MAX_CHARS || 4096);
-const STREAM_REALTIME_DELTAS = (process.env.STREAM_REALTIME_DELTAS || "0") === "1";
+const API_LOG_BODY_MAX_CHARS = Number(
+  process.env.API_LOG_BODY_MAX_CHARS || 4096,
+);
+const STREAM_REALTIME_DELTAS =
+  (process.env.STREAM_REALTIME_DELTAS || "0") === "1";
 const MAX_WEB_PROMPT_CHARS = Number(process.env.MAX_WEB_PROMPT_CHARS || 16000);
-const MAX_TOOL_RESULTS_CHARS = Number(process.env.MAX_TOOL_RESULTS_CHARS || 4000);
+const MAX_TOOL_RESULTS_CHARS = Number(
+  process.env.MAX_TOOL_RESULTS_CHARS || 4000,
+);
+const INCLUDE_TOOLS_IN_WEB_PROMPT =
+  (process.env.INCLUDE_TOOLS_IN_WEB_PROMPT || "1") === "1";
+const ONLY_LAST_MESSAGE_IN_WEB_PROMPT = (() => {
+  const value =
+    process.env.ONLY_LAST_MESSAGE_IN_WEB_PROMPT ??
+    process.env.ONLY_LAST_USER_MESSAGE_IN_WEB_PROMPT ??
+    "1";
+  return value === "1";
+})();
+const CHAT_COMPLETION_REQUEST_LOG_FILE =
+  process.env.CHAT_COMPLETION_REQUEST_LOG_FILE ||
+  path.join(process.cwd(), "logs", "chat-completions.jsonl");
 
 function jsonResponse(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -45,6 +64,43 @@ function logApi(payload) {
   } catch {}
 }
 
+async function appendJsonl(filePath, payload) {
+  const line = `${JSON.stringify(payload)}\n`;
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, line, "utf8");
+}
+
+async function logChatCompletionRequest({
+  apiRequestId,
+  endpoint,
+  raw,
+  body,
+  parseOk,
+  logFilePath = CHAT_COMPLETION_REQUEST_LOG_FILE,
+}) {
+  const record = {
+    ts: new Date().toISOString(),
+    id: apiRequestId,
+    endpoint,
+    parseOk,
+    rawLength: typeof raw === "string" ? raw.length : 0,
+    rawBody: typeof raw === "string" ? raw : "",
+    body: body || null,
+    includeToolsInWebPrompt: INCLUDE_TOOLS_IN_WEB_PROMPT,
+  };
+
+  try {
+    await appendJsonl(logFilePath, record);
+  } catch (error) {
+    logApi({
+      type: "api.local_log_error",
+      id: apiRequestId,
+      endpoint,
+      message: error?.message || String(error),
+    });
+  }
+}
+
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -65,21 +121,28 @@ function parseJsonBody(raw) {
   return JSON.parse(raw);
 }
 
-function extractUserMessage(messages) {
+function extractMessageText(message) {
+  if (!message || typeof message !== "object") return "";
+
+  if (typeof message.content === "string") return message.content;
+
+  if (Array.isArray(message.content)) {
+    const text = message.content
+      .map((part) => (typeof part?.text === "string" ? part.text : ""))
+      .join("");
+    if (text) return text;
+  }
+
+  return "";
+}
+
+function extractLastMessageText(messages) {
   if (!Array.isArray(messages)) return "";
 
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];
-    if (msg?.role !== "user") continue;
-
-    if (typeof msg.content === "string") return msg.content;
-
-    if (Array.isArray(msg.content)) {
-      const text = msg.content
-        .map((part) => (typeof part?.text === "string" ? part.text : ""))
-        .join("");
-      if (text) return text;
-    }
+    const text = extractMessageText(msg);
+    if (text) return text;
   }
 
   return "";
@@ -88,7 +151,12 @@ function extractUserMessage(messages) {
 function extractSystemMessages(messages) {
   if (!Array.isArray(messages)) return [];
   return messages
-    .filter((m) => m?.role === "system" && typeof m?.content === "string" && m.content.trim())
+    .filter(
+      (m) =>
+        m?.role === "system" &&
+        typeof m?.content === "string" &&
+        m.content.trim(),
+    )
     .map((m) => m.content.trim());
 }
 
@@ -163,8 +231,12 @@ function buildCompactToolsInstruction(tools, toolChoice) {
       return {
         name: typeof fn.name === "string" ? fn.name : "",
         description:
-          typeof fn.description === "string" ? safeSnippet(fn.description, 120) : "",
-        required: Array.isArray(fn?.parameters?.required) ? fn.parameters.required : [],
+          typeof fn.description === "string"
+            ? safeSnippet(fn.description, 120)
+            : "",
+        required: Array.isArray(fn?.parameters?.required)
+          ? fn.parameters.required
+          : [],
         properties: propertyTypes,
       };
     })
@@ -199,49 +271,74 @@ function truncateToolResults(toolResults, maxChars) {
   return out;
 }
 
-function buildWebPromptFromOpenAiBody(body) {
-  const messages = Array.isArray(body?.messages) ? body.messages : [];
-  const userText = extractUserMessage(messages);
-  if (!userText) return "";
+function buildPromptSections({ systemMessages, toolsInstruction, toolResults, lastMessageText }) {
+  const sections = [];
+  if (systemMessages.length > 0) {
+    sections.push(`System:\n${systemMessages.join("\n\n")}`);
+  }
+  if (toolsInstruction) {
+    sections.push(`Tooling Contract:\n${toolsInstruction}`);
+  }
+  if (toolResults.length > 0) {
+    sections.push(
+      `Tool Results:\n${toolResults
+        .map((r) => `tool_call_id=${r.callId || "unknown"}\n${r.content}`)
+        .join("\n\n")}`,
+    );
+  }
+  sections.push(`User:\n${lastMessageText}`);
+  return sections.join("\n\n");
+}
 
+function buildWebPromptFromOpenAiBody(body, options = {}) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const lastMessageText = extractLastMessageText(messages);
+  if (!lastMessageText) return "";
+
+  const onlyLastUserMessage =
+    options.onlyLastUserMessage ?? ONLY_LAST_MESSAGE_IN_WEB_PROMPT;
   const systemMessages = extractSystemMessages(messages);
   const toolResults = extractToolResultMessages(messages);
-  const toolsInstruction = buildToolsInstruction(body?.tools, body?.tool_choice);
+  const includeToolsInstruction =
+    options.includeToolsInstruction ?? INCLUDE_TOOLS_IN_WEB_PROMPT;
+  const toolsInstruction = includeToolsInstruction
+    ? buildToolsInstruction(body?.tools, body?.tool_choice)
+    : "";
 
-  const buildPrompt = (opts) => {
-    const sections = [];
-    if (systemMessages.length > 0) {
-      sections.push(`System:\n${systemMessages.join("\n\n")}`);
-    }
-    if (opts.toolsInstruction) {
-      sections.push(`Tooling Contract:\n${opts.toolsInstruction}`);
-    }
-    if (opts.toolResults.length > 0) {
-      sections.push(
-        `Tool Results:\n${opts.toolResults
-          .map((r) => `tool_call_id=${r.callId || "unknown"}\n${r.content}`)
-          .join("\n\n")}`,
-      );
-    }
-    sections.push(`User:\n${userText}`);
-    return sections.join("\n\n");
-  };
+  if (onlyLastUserMessage) {
+    const prompt = toolsInstruction
+      ? `${lastMessageText}\n\nTooling Contract:\n${toolsInstruction}`
+      : lastMessageText;
+    return prompt.slice(0, MAX_WEB_PROMPT_CHARS);
+  }
 
-  let prompt = buildPrompt({
+  let prompt = buildPromptSections({
+    systemMessages,
     toolsInstruction,
     toolResults,
+    lastMessageText,
   });
   if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
 
-  prompt = buildPrompt({
+  prompt = buildPromptSections({
+    systemMessages,
     toolsInstruction,
     toolResults: truncateToolResults(toolResults, MAX_TOOL_RESULTS_CHARS),
+    lastMessageText,
   });
   if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
 
-  prompt = buildPrompt({
-    toolsInstruction: buildCompactToolsInstruction(body?.tools, body?.tool_choice),
-    toolResults: truncateToolResults(toolResults, Math.floor(MAX_TOOL_RESULTS_CHARS / 2)),
+  prompt = buildPromptSections({
+    systemMessages,
+    toolsInstruction: buildCompactToolsInstruction(
+      body?.tools,
+      body?.tool_choice,
+    ),
+    toolResults: truncateToolResults(
+      toolResults,
+      Math.floor(MAX_TOOL_RESULTS_CHARS / 2),
+    ),
+    lastMessageText,
   });
   if (prompt.length <= MAX_WEB_PROMPT_CHARS) return prompt;
 
@@ -330,19 +427,19 @@ function summarizeToolsForLog(tools) {
   if (!Array.isArray(tools)) return [];
 
   return tools.map((tool, index) => {
-    const fn = tool?.function && typeof tool.function === "object"
-      ? tool.function
-      : {};
-    const parameters = fn.parameters && typeof fn.parameters === "object"
-      ? fn.parameters
-      : null;
+    const fn =
+      tool?.function && typeof tool.function === "object" ? tool.function : {};
+    const parameters =
+      fn.parameters && typeof fn.parameters === "object" ? fn.parameters : null;
 
     return {
       index,
       type: typeof tool?.type === "string" ? tool.type : null,
       functionName: typeof fn.name === "string" ? fn.name : null,
       functionDescription:
-        typeof fn.description === "string" ? safeSnippet(fn.description, 200) : null,
+        typeof fn.description === "string"
+          ? safeSnippet(fn.description, 200)
+          : null,
       parameterKeys: parameters ? Object.keys(parameters) : [],
     };
   });
@@ -440,13 +537,7 @@ function buildChatCompletionResponse({ body, result }) {
   };
 }
 
-function buildChatCompletionChunk({
-  id,
-  created,
-  model,
-  delta,
-  finishReason,
-}) {
+function buildChatCompletionChunk({ id, created, model, delta, finishReason }) {
   return {
     id,
     object: "chat.completion.chunk",
@@ -621,7 +712,9 @@ function createApiServer({
     const remoteAddress = req.socket?.remoteAddress || null;
     const contentLengthHeader = req.headers["content-length"];
     const contentLength =
-      typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : null;
+      typeof contentLengthHeader === "string"
+        ? Number(contentLengthHeader)
+        : null;
 
     logApi({
       type: "api.request",
@@ -630,7 +723,10 @@ function createApiServer({
       url: req.url,
       remoteAddress,
       contentLength,
-      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : null,
+      userAgent:
+        typeof req.headers["user-agent"] === "string"
+          ? req.headers["user-agent"]
+          : null,
     });
 
     res.on("finish", () => {
@@ -690,7 +786,8 @@ function createApiServer({
           rawSnippet: API_LOG_BODY_SNIPPET
             ? safeSnippet(raw, API_LOG_BODY_MAX_CHARS)
             : undefined,
-          hasChatUrl: typeof body?.chat_url === "string" && Boolean(body.chat_url),
+          hasChatUrl:
+            typeof body?.chat_url === "string" && Boolean(body.chat_url),
         });
         const chatUrl =
           typeof body.chat_url === "string" ? body.chat_url : NEW_CHAT_URL;
@@ -784,7 +881,11 @@ function createApiServer({
           }
         }
 
-        return jsonResponse(res, 200, { id: sessionId, object: "session", deleted: true });
+        return jsonResponse(res, 200, {
+          id: sessionId,
+          object: "session",
+          deleted: true,
+        });
       }
     }
 
@@ -809,8 +910,23 @@ function createApiServer({
             : undefined,
           message: error?.message || String(error),
         });
+        await logChatCompletionRequest({
+          apiRequestId,
+          endpoint: "/v1/chat/completions",
+          raw,
+          body: null,
+          parseOk: false,
+        });
         return jsonResponse(res, 400, { error: "invalid json" });
       }
+
+      await logChatCompletionRequest({
+        apiRequestId,
+        endpoint: "/v1/chat/completions",
+        raw,
+        body,
+        parseOk: true,
+      });
 
       const userText = buildWebPromptFromOpenAiBody(body);
       const sessionId =
@@ -830,10 +946,14 @@ function createApiServer({
         model: typeof body?.model === "string" ? body.model : null,
         stream: Boolean(body?.stream),
         sessionId,
-        messagesCount: Array.isArray(body?.messages) ? body.messages.length : null,
+        messagesCount: Array.isArray(body?.messages)
+          ? body.messages.length
+          : null,
         toolsCount: Array.isArray(body?.tools) ? body.tools.length : 0,
         tools: summarizeToolsForLog(body?.tools),
         toolChoice: summarizeToolChoiceForLog(body?.tool_choice),
+        includeToolsInWebPrompt: INCLUDE_TOOLS_IN_WEB_PROMPT,
+        onlyLastMessageInWebPrompt: ONLY_LAST_MESSAGE_IN_WEB_PROMPT,
         promptTokens: estimatePromptTokens(body?.messages),
         userText: API_LOG_USER_TEXT ? safeSnippet(userText, 240) : undefined,
         userTextLength: userText.length,
@@ -924,8 +1044,12 @@ function createApiServer({
               id: apiRequestId,
               streamedLength: streamedText.length,
               finalLength: assistant.content.length,
-              streamedText: API_LOG_USER_TEXT ? safeSnippet(streamedText, 240) : undefined,
-              finalText: API_LOG_USER_TEXT ? safeSnippet(assistant.content, 240) : undefined,
+              streamedText: API_LOG_USER_TEXT
+                ? safeSnippet(streamedText, 240)
+                : undefined,
+              finalText: API_LOG_USER_TEXT
+                ? safeSnippet(assistant.content, 240)
+                : undefined,
             });
           }
 
@@ -973,7 +1097,11 @@ function createApiServer({
       }
 
       const result = await session.conversationClient.runConversation(userText);
-      return jsonResponse(res, 200, buildChatCompletionResponse({ body, result }));
+      return jsonResponse(
+        res,
+        200,
+        buildChatCompletionResponse({ body, result }),
+      );
     } catch (error) {
       logApi({
         type: "api.error",
@@ -1016,7 +1144,12 @@ async function main() {
     "default",
   );
   await conversationClient.waitUntilReady();
-  createApiServer({ port: PORT, context, conversationClient, defaultPage: page });
+  createApiServer({
+    port: PORT,
+    context,
+    conversationClient,
+    defaultPage: page,
+  });
 }
 
 if (require.main === module) {
@@ -1031,4 +1164,5 @@ module.exports = {
   createSession,
   createPageConversationClient,
   buildWebPromptFromOpenAiBody,
+  logChatCompletionRequest,
 };

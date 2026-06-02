@@ -19,6 +19,9 @@ node /Volumes/Code/caixun/spp-test/patchright-node/index.js
 - `NEW_CHAT_URL`：新会话默认页面 URL（`/v1/sessions` 未传 `chat_url` 时使用）
 - `MODEL_NAME`：默认模型名（响应 `model` 回退值）
 - `SYSTEM_FINGERPRINT`：响应中的 `system_fingerprint`
+- `ONLY_LAST_MESSAGE_IN_WEB_PROMPT`：是否只把最后一个消息传到页面，默认 `1`。兼容旧变量 `ONLY_LAST_USER_MESSAGE_IN_WEB_PROMPT`
+- `INCLUDE_TOOLS_IN_WEB_PROMPT`：是否把 `tools` / `tool_choice` 注入到页面 prompt 中，默认 `1`
+- `CHAT_COMPLETION_REQUEST_LOG_FILE`：`/v1/chat/completions` 的本地 JSONL 日志路径，默认 `./logs/chat-completions.jsonl`
 
 ---
 
